@@ -1,5 +1,4 @@
-# Core
-python>=3.10
+# Python 3.10+ required (see pyproject.toml)
 
 # ML / Deep Learning
 torch>=2.2

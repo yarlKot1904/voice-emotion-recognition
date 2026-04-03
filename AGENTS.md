@@ -32,12 +32,13 @@ Output: predicted emotion label (e.g., happy, sad, angry, neutral)
 
 ## Dataset
 
-Recommended:
-- RAVDESS
-- CREMA-D (optional extension)
+Primary: **[Dusha](https://github.com/salute-developers/golos/tree/master/dusha#dusha-dataset)** (Crowd domain: Russian speech, ~201k wav, 4 emotions `angry` / `sad` / `neutral` / `positive`).  
+Unpack `crowd.tar`, set `DUSHA_ROOT`, then run `python -m src.data.build_manifest`.  
+Podcast domain has no public raw audio; optional `.npy` features via `features.tar` — see `src/data/podcast_features.py`.  
+License: [Dusha license](https://github.com/salute-developers/golos/tree/master/dusha#license).
 
 Data format:
-- `.wav` files
+- `.wav` files + `raw_crowd_*.jsonl` markup
 - labeled by emotion class
 
 ---
@@ -47,34 +48,36 @@ Data format:
 project-root/
 │
 ├── data/
-│ ├── raw/
-│ └── processed/
+│ ├── raw/          # DUSHA_ROOT / crowd.tar contents
+│ └── processed/    # manifest.csv, splits/*.csv
 │
 ├── src/
+│ ├── config.py
 │ ├── data/
-│ │ ├── loader.py
-│ │ └── preprocessing.py
-│ │
+│ │ ├── build_manifest.py
+│ │ ├── manifest.py
+│ │ ├── dataset.py
+│ │ ├── preprocessing.py
+│ │ └── podcast_features.py
 │ ├── features/
 │ │ └── audio_features.py
-│ │
 │ ├── models/
 │ │ ├── cnn_model.py
 │ │ └── mlp_model.py
-│ │
 │ ├── training/
 │ │ ├── train.py
-│ │ └── evaluate.py
-│ │
+│ │ ├── evaluate.py
+│ │ └── metrics.py
 │ └── inference/
-│ └── predict.py
+│     └── predict.py
 │
 ├── demo/
 │ └── app.py
 │
 ├── notebooks/
-│
+├── pyproject.toml
 ├── requirements.txt
+├── README.md
 └── AGENTS.md
 ```
 
