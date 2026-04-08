@@ -10,4 +10,4 @@ data/processed/*.csv
 *.egg-info/
 dist/
 build/
-data/
+/data/

@@ -27,6 +27,7 @@ from src.data.dataset import (
 from src.models.cnn_model import MelCNN
 from src.models.mel_frontend import build_waveform_cnn
 from src.models.mlp_model import MLPClassifier
+from src.runtime.device import choose_device
 
 _DEFAULT_NUM_WORKERS = 0 if sys.platform == "win32" else 2
 
@@ -204,7 +205,7 @@ def main() -> None:
     args = p.parse_args()
 
     set_seed(RANDOM_SEED)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device, device_note = choose_device()
     use_amp = bool(args.amp and device.type == "cuda")
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
@@ -336,6 +337,9 @@ def main() -> None:
     best_val = -1.0
     stale = 0
     grad_clip = args.grad_clip if args.grad_clip > 0 else 0.0
+
+    if device_note:
+        print(device_note)
 
     if use_amp:
         print("Mixed precision (AMP) enabled on CUDA.")

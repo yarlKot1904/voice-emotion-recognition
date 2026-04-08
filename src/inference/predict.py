@@ -20,6 +20,7 @@ from src.features.audio_features import (
 from src.models.cnn_model import MelCNN
 from src.models.mel_frontend import build_waveform_cnn
 from src.models.mlp_model import MLPClassifier
+from src.runtime.device import choose_device
 from src.training.feature_config import merge_with_checkpoint
 
 
@@ -80,7 +81,10 @@ def load_model(ckpt_path: Path, device: torch.device) -> tuple[nn.Module, str, d
 def predict_file(
     ckpt_path: Path, wav_path: Path, device: torch.device | None = None
 ) -> tuple[str, list[float]]:
-    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device is None:
+        device, device_note = choose_device()
+        if device_note:
+            print(device_note)
     model, model_type, fc = load_model(ckpt_path, device)
 
     sr = int(fc.get("sample_rate", SAMPLE_RATE))

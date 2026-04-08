@@ -20,6 +20,7 @@ from src.data.dataset import (
 from src.models.cnn_model import MelCNN
 from src.models.mel_frontend import build_waveform_cnn
 from src.models.mlp_model import MLPClassifier
+from src.runtime.device import choose_device
 from src.training.feature_config import merge_with_checkpoint
 from src.training.metrics import compute_metrics
 
@@ -81,7 +82,9 @@ def main() -> None:
         collate_fn=collate,
     )
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device, device_note = choose_device()
+    if device_note:
+        print(device_note)
     if model_type == "mlp":
         model = MLPClassifier().to(device)
     elif use_torchaudio:
