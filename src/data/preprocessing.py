@@ -24,6 +24,20 @@ def fix_length(y: np.ndarray, target_length: int, *, random_crop: bool = False) 
     return np.asarray(y, dtype=np.float32)
 
 
+def _shift_with_silence(y: np.ndarray, shift: int) -> np.ndarray:
+    if shift == 0:
+        return y
+
+    out = np.zeros_like(y)
+    if abs(shift) >= y.shape[0]:
+        return out
+    if shift > 0:
+        out[shift:] = y[:-shift]
+    else:
+        out[:shift] = y[-shift:]
+    return out
+
+
 def augment_waveform(y: np.ndarray) -> np.ndarray:
     if y.size == 0:
         return y
@@ -32,7 +46,7 @@ def augment_waveform(y: np.ndarray) -> np.ndarray:
 
     shift = int(np.random.randint(-1600, 1601))
     if shift:
-        out = np.roll(out, shift)
+        out = _shift_with_silence(out, shift)
 
     gain = float(np.random.uniform(0.9, 1.1))
     out *= gain
@@ -42,4 +56,3 @@ def augment_waveform(y: np.ndarray) -> np.ndarray:
         out += np.random.normal(0.0, noise_scale, size=out.shape).astype(np.float32)
 
     return np.clip(out, -1.0, 1.0)
-

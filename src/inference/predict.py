@@ -44,6 +44,7 @@ def load_model(ckpt_path: Path, device: torch.device) -> tuple[nn.Module, str, d
     ckpt = torch.load(ckpt_path, map_location="cpu")
     fc = merge_with_checkpoint(ckpt)
     model_type = ckpt.get("model_type", "cnn")
+    mel_norm = bool(fc.get("mel_norm", ckpt.get("mel_norm", False)))
 
     if model_type == "mlp":
         model = MLPClassifier()
@@ -61,6 +62,7 @@ def load_model(ckpt_path: Path, device: torch.device) -> tuple[nn.Module, str, d
             int(fc["hop_length"]),
             int(fc["n_mels"]),
             variant,
+            normalize_input=mel_norm,
         )
         model.to(device)
         sr = int(fc["sample_rate"])
@@ -70,7 +72,7 @@ def load_model(ckpt_path: Path, device: torch.device) -> tuple[nn.Module, str, d
         model.eval()
         return model, model_type, fc
 
-    model = MelCNN(variant=variant)
+    model = MelCNN(variant=variant, normalize_input=mel_norm)
     model.to(device)
     model(_dummy_mel_batch(model_type, device, fc))
     model.load_state_dict(ckpt["model"])

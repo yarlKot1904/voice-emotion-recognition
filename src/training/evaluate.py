@@ -38,6 +38,7 @@ def main() -> None:
     ckpt = torch.load(args.checkpoint, map_location="cpu")
     model_type = ckpt.get("model_type", "cnn")
     fc = merge_with_checkpoint(ckpt)
+    mel_norm = bool(fc.get("mel_norm", ckpt.get("mel_norm", False)))
 
     use_torchaudio = model_type == "cnn" and fc.get("mel_backend") == "torchaudio"
 
@@ -94,10 +95,11 @@ def main() -> None:
             int(fc["hop_length"]),
             int(fc["n_mels"]),
             ckpt.get("cnn_variant", "large"),
+            normalize_input=mel_norm,
         ).to(device)
     else:
         variant = ckpt.get("cnn_variant", "base")
-        model = MelCNN(variant=variant).to(device)
+        model = MelCNN(variant=variant, normalize_input=mel_norm).to(device)
 
     x0, _ = next(iter(loader))
     x0 = x0.to(device)

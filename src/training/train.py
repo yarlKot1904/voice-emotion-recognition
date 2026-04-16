@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import csv
+import math
 import sys
 from pathlib import Path
 
@@ -46,7 +47,12 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def class_weights_from_csv(csv_path: Path, num_classes: int) -> torch.Tensor:
+def class_weights_from_csv(
+    csv_path: Path,
+    num_classes: int,
+    *,
+    power: float = 0.5,
+) -> torch.Tensor:
     labels: list[int] = []
     with open(csv_path, encoding="utf-8") as f:
         for row in csv.DictReader(f):
@@ -54,7 +60,7 @@ def class_weights_from_csv(csv_path: Path, num_classes: int) -> torch.Tensor:
     arr = np.array(labels, dtype=np.int64)
     counts = np.bincount(arr, minlength=num_classes).astype(np.float64)
     counts = np.maximum(counts, 1.0)
-    w = 1.0 / counts
+    w = np.power(counts, -power)
     w = w * num_classes / w.sum()
     return torch.tensor(w, dtype=torch.float32)
 
@@ -71,6 +77,8 @@ def run_epoch(
     grad_clip: float = 0.0,
     use_amp: bool = False,
     scaler: object | None = None,
+    batch_scheduler: object | None = None,
+    grad_accum_steps: int = 1,
 ) -> tuple[float, float]:
     if train:
         np.random.seed(RANDOM_SEED + epoch * 10009)
@@ -78,29 +86,40 @@ def run_epoch(
     total_loss = 0.0
     correct = 0
     total = 0
-    for xb, yb in tqdm(loader, leave=False):
+    accum_steps = max(int(grad_accum_steps), 1)
+    if train:
+        optimizer.zero_grad(set_to_none=True)
+    num_batches = len(loader)
+    for batch_idx, (xb, yb) in enumerate(tqdm(loader, leave=False), start=1):
         xb = xb.to(device)
         yb = yb.to(device)
-        if train:
-            optimizer.zero_grad(set_to_none=True)
 
         with _amp_fwd_context(device, use_amp):
             logits = model(xb)
             loss = criterion(logits, yb)
 
         if train:
+            scaled_loss = loss / accum_steps
             if scaler is not None and use_amp:
-                scaler.scale(loss).backward()
-                if grad_clip > 0:
-                    scaler.unscale_(optimizer)
-                    nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                scaler.step(optimizer)
-                scaler.update()
+                scaler.scale(scaled_loss).backward()
             else:
-                loss.backward()
-                if grad_clip > 0:
-                    nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                optimizer.step()
+                scaled_loss.backward()
+
+            should_step = batch_idx % accum_steps == 0 or batch_idx == num_batches
+            if should_step:
+                if scaler is not None and use_amp:
+                    if grad_clip > 0:
+                        scaler.unscale_(optimizer)
+                        nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    if grad_clip > 0:
+                        nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                if batch_scheduler is not None:
+                    batch_scheduler.step()
 
         total_loss += loss.item() * xb.size(0)
         pred = logits.argmax(dim=1)
@@ -144,15 +163,40 @@ def _make_grad_scaler(use_amp: bool) -> object | None:
         return torch.cuda.amp.GradScaler()
 
 
+def _amp_supported(device: torch.device) -> tuple[bool, str | None]:
+    if device.type != "cuda":
+        return False, None
+    major, minor = torch.cuda.get_device_capability(device)
+    if major < 7:
+        return (
+            False,
+            f"AMP disabled: GPU compute capability sm_{major}{minor} is too old "
+            "for stable FP16 training here.",
+        )
+    return True, None
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--model", choices=("mlp", "cnn"), default="cnn")
-    p.add_argument("--cnn-variant", choices=("base", "large"), default="large", help="CNN width/depth (default: large for better accuracy).")
+    p.add_argument(
+        "--cnn-variant",
+        choices=("base", "large", "resnet"),
+        default="resnet",
+        help="CNN architecture (default: resnet for better short-run accuracy).",
+    )
     p.add_argument("--splits-dir", type=Path, default=SPLITS_DIR)
     p.add_argument("--epochs", type=int, default=40)
     p.add_argument("--batch-size", type=int, default=32)
-    p.add_argument("--lr", type=float, default=8e-4)
+    p.add_argument(
+        "--grad-accum-steps",
+        type=int,
+        default=1,
+        help="Accumulate gradients over N micro-batches; useful for 4GB GPUs.",
+    )
+    p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-4)
+    p.add_argument("--optimizer", choices=("adam", "adamw"), default="adamw")
     p.add_argument("--patience", type=int, default=10)
     p.add_argument(
         "--num-workers",
@@ -172,13 +216,48 @@ def main() -> None:
     p.set_defaults(augment=True)
     p.add_argument("--class-weights", action="store_true", help="Inverse-frequency class weights in loss.")
     p.add_argument(
+        "--class-weight-power",
+        type=float,
+        default=0.5,
+        help="Class-weight strength: 0.5=sqrt inverse, 1.0=full inverse.",
+    )
+    p.add_argument(
         "--label-smoothing",
         type=float,
         default=0.0,
         help="e.g. 0.05 for regularization; 0 disables.",
     )
     p.add_argument("--grad-clip", type=float, default=1.0, help="0 disables.")
-    p.add_argument("--scheduler", action="store_true", help="ReduceLROnPlateau on val acc.")
+    p.add_argument("--scheduler", action="store_true", help="Legacy alias: ReduceLROnPlateau on val acc.")
+    p.add_argument(
+        "--lr-schedule",
+        choices=("none", "plateau", "onecycle", "cosine"),
+        default="onecycle",
+        help="LR schedule; onecycle usually learns faster in short runs.",
+    )
+    p.add_argument(
+        "--no-mel-norm",
+        dest="mel_norm",
+        action="store_false",
+        help="Disable per-sample log-mel normalization for CNN.",
+    )
+    p.set_defaults(mel_norm=True)
+    p.add_argument(
+        "--spec-augment",
+        dest="spec_augment",
+        action="store_true",
+        help="Enable training-time SpecAugment for CNN.",
+    )
+    p.add_argument(
+        "--no-spec-augment",
+        dest="spec_augment",
+        action="store_false",
+        help="Disable training-time SpecAugment for CNN.",
+    )
+    p.set_defaults(spec_augment=False)
+    p.add_argument("--spec-augment-p", type=float, default=0.5)
+    p.add_argument("--spec-freq-mask", type=int, default=8)
+    p.add_argument("--spec-time-mask", type=int, default=16)
     p.add_argument(
         "--no-amp",
         dest="amp",
@@ -203,10 +282,15 @@ def main() -> None:
         help="CNN: mel через torchaudio на GPU, в Dataset только wav (сильно быстрее на CUDA).",
     )
     args = p.parse_args()
+    if args.grad_accum_steps < 1:
+        raise SystemExit("--grad-accum-steps must be >= 1")
+    if args.scheduler:
+        args.lr_schedule = "plateau"
 
     set_seed(RANDOM_SEED)
     device, device_note = choose_device()
-    use_amp = bool(args.amp and device.type == "cuda")
+    amp_supported, amp_note = _amp_supported(device)
+    use_amp = bool(args.amp and amp_supported)
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
         try:
@@ -225,6 +309,7 @@ def main() -> None:
         "n_mels": args.n_mels,
         "n_mfcc": args.n_mfcc,
         "mel_backend": "torchaudio" if args.mel_on_gpu else "librosa",
+        "mel_norm": bool(args.mel_norm and args.model == "cnn"),
     }
 
     train_csv = args.splits_dir / "train.csv"
@@ -301,10 +386,22 @@ def main() -> None:
             args.hop_length,
             args.n_mels,
             args.cnn_variant,
+            normalize_input=args.mel_norm,
+            spec_augment=args.spec_augment,
+            spec_augment_p=args.spec_augment_p,
+            spec_freq_mask=args.spec_freq_mask,
+            spec_time_mask=args.spec_time_mask,
         ).to(device)
         cnn_variant = args.cnn_variant
     else:
-        model = MelCNN(variant=args.cnn_variant).to(device)
+        model = MelCNN(
+            variant=args.cnn_variant,
+            normalize_input=args.mel_norm,
+            spec_augment=args.spec_augment,
+            spec_augment_p=args.spec_augment_p,
+            spec_freq_mask=args.spec_freq_mask,
+            spec_time_mask=args.spec_time_mask,
+        ).to(device)
         cnn_variant = args.cnn_variant
 
     x0, y0 = next(iter(train_loader))
@@ -318,16 +415,41 @@ def main() -> None:
 
     weight = None
     if args.class_weights:
-        weight = class_weights_from_csv(train_csv, NUM_CLASSES).to(device)
+        weight = class_weights_from_csv(
+            train_csv,
+            NUM_CLASSES,
+            power=args.class_weight_power,
+        ).to(device)
 
     ls = args.label_smoothing if args.label_smoothing > 0 else 0.0
     criterion = nn.CrossEntropyLoss(weight=weight, label_smoothing=ls)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer_cls = torch.optim.AdamW if args.optimizer == "adamw" else torch.optim.Adam
+    optimizer = optimizer_cls(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer_steps_per_epoch = max(
+        math.ceil(len(train_loader) / max(args.grad_accum_steps, 1)),
+        1,
+    )
 
-    scheduler = None
-    if args.scheduler:
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    epoch_scheduler = None
+    batch_scheduler = None
+    if args.lr_schedule == "plateau":
+        epoch_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode="max", factor=0.5, patience=4
+        )
+    elif args.lr_schedule == "onecycle":
+        batch_scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=args.lr,
+            epochs=max(args.epochs, 1),
+            steps_per_epoch=optimizer_steps_per_epoch,
+            pct_start=0.2 if args.epochs <= 10 else 0.1,
+            div_factor=10.0,
+            final_div_factor=100.0,
+        )
+    elif args.lr_schedule == "cosine":
+        epoch_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(args.epochs, 1),
         )
 
     ckpt_dir = args.checkpoint_dir / args.exp_name
@@ -343,6 +465,8 @@ def main() -> None:
 
     if use_amp:
         print("Mixed precision (AMP) enabled on CUDA.")
+    elif amp_note and args.amp:
+        print(amp_note)
     elif device.type == "cpu":
         print(
             "Обучение на CPU — AMP недоступен. Установите PyTorch с поддержкой CUDA для GPU и ускорения."
@@ -355,6 +479,16 @@ def main() -> None:
             "Режим --mel-on-gpu: mel считается на GPU (torchaudio). "
             "Старые чекпоинты с librosa без переобучения не подмешивать."
         )
+    if args.model == "cnn":
+        print(
+            f"CNN variant={args.cnn_variant}, mel_norm={args.mel_norm}, "
+            f"spec_augment={args.spec_augment}"
+        )
+    print(
+        f"Optimizer={args.optimizer}, lr={args.lr:.2e}, "
+        f"lr_schedule={args.lr_schedule}, label_smoothing={ls:.3f}, "
+        f"effective_batch={args.batch_size * max(args.grad_accum_steps, 1)}"
+    )
 
     for epoch in range(1, args.epochs + 1):
         tr_loss, tr_acc = run_epoch(
@@ -368,6 +502,8 @@ def main() -> None:
             grad_clip=grad_clip,
             use_amp=use_amp,
             scaler=scaler,
+            batch_scheduler=batch_scheduler,
+            grad_accum_steps=args.grad_accum_steps,
         )
         va_loss, va_acc = evaluate(
             model, val_loader, device, criterion, use_amp=use_amp
@@ -377,8 +513,11 @@ def main() -> None:
             f"Epoch {epoch:03d} train_loss={tr_loss:.4f} acc={tr_acc:.4f} | "
             f"val_loss={va_loss:.4f} val_acc={va_acc:.4f} lr={lr_now:.2e}"
         )
-        if scheduler:
-            scheduler.step(va_acc)
+        if epoch_scheduler:
+            if isinstance(epoch_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                epoch_scheduler.step(va_acc)
+            else:
+                epoch_scheduler.step()
         if writer:
             writer.add_scalar("loss/train", tr_loss, epoch)
             writer.add_scalar("loss/val", va_loss, epoch)
@@ -397,9 +536,26 @@ def main() -> None:
                 "model_type": args.model,
                 "class_names": list(CLASS_NAMES),
                 "feature_config": feature_cfg,
+                "training_config": {
+                    "optimizer": args.optimizer,
+                    "lr": args.lr,
+                    "weight_decay": args.weight_decay,
+                    "batch_size": args.batch_size,
+                    "grad_accum_steps": args.grad_accum_steps,
+                    "label_smoothing": ls,
+                    "lr_schedule": args.lr_schedule,
+                    "class_weights": bool(args.class_weights),
+                    "class_weight_power": args.class_weight_power,
+                    "augment": bool(args.augment),
+                    "spec_augment": bool(args.spec_augment and args.model == "cnn"),
+                    "spec_augment_p": args.spec_augment_p,
+                    "spec_freq_mask": args.spec_freq_mask,
+                    "spec_time_mask": args.spec_time_mask,
+                },
             }
             if cnn_variant is not None:
                 payload["cnn_variant"] = cnn_variant
+                payload["mel_norm"] = bool(args.mel_norm)
             torch.save(payload, ckpt_dir / "best.pt")
         else:
             stale += 1
@@ -409,7 +565,10 @@ def main() -> None:
 
     if writer:
         writer.close()
-    print(f"Best val acc={best_val:.4f}, checkpoint: {ckpt_dir / 'best.pt'}")
+    if best_val >= 0:
+        print(f"Best val acc={best_val:.4f}, checkpoint: {ckpt_dir / 'best.pt'}")
+    else:
+        print("No epochs completed; no checkpoint saved.")
 
 
 if __name__ == "__main__":

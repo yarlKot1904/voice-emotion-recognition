@@ -54,10 +54,22 @@ class MelCNNWithFrontend(nn.Module):
         n_mels: int,
         *,
         cnn_variant: str = "large",
+        normalize_input: bool = False,
+        spec_augment: bool = False,
+        spec_augment_p: float = 0.5,
+        spec_freq_mask: int = 8,
+        spec_time_mask: int = 16,
     ) -> None:
         super().__init__()
         self.frontend = LogMelFrontend(sample_rate, n_fft, hop_length, n_mels)
-        self.backbone = MelCNN(variant=cnn_variant)
+        self.backbone = MelCNN(
+            variant=cnn_variant,
+            normalize_input=normalize_input,
+            spec_augment=spec_augment,
+            spec_augment_p=spec_augment_p,
+            spec_freq_mask=spec_freq_mask,
+            spec_time_mask=spec_time_mask,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.backbone(self.frontend(x))
@@ -69,6 +81,12 @@ def build_waveform_cnn(
     hop_length: int,
     n_mels: int,
     cnn_variant: str,
+    *,
+    normalize_input: bool = False,
+    spec_augment: bool = False,
+    spec_augment_p: float = 0.5,
+    spec_freq_mask: int = 8,
+    spec_time_mask: int = 16,
 ) -> MelCNNWithFrontend:
     return MelCNNWithFrontend(
         sample_rate=sample_rate,
@@ -76,4 +94,9 @@ def build_waveform_cnn(
         hop_length=hop_length,
         n_mels=n_mels,
         cnn_variant=cnn_variant,
+        normalize_input=normalize_input,
+        spec_augment=spec_augment,
+        spec_augment_p=spec_augment_p,
+        spec_freq_mask=spec_freq_mask,
+        spec_time_mask=spec_time_mask,
     )

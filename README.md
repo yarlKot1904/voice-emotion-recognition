@@ -35,37 +35,36 @@ MLP baseline: `--model mlp`.
 ### Улучшение качества (рекомендуется)
 
 - Больше данных: пересоберите манифест **без** `--max-total` (или с большим лимитом).
-- По умолчанию для CNN включены **аугментации** (сдвиг по времени + шум); отключить: `--no-augment`.
-- Более ёмкая модель: `--cnn-variant large` (по умолчанию уже `large`).
-- Пример «усиленного» прогона:
+- По умолчанию для CNN включены waveform-аугментации (сдвиг + gain + шум) и нормализация log-mel; SpecAugment включайте отдельно через `--spec-augment`, когда обучаете дольше 5-10 эпох.
+- Рекомендуемая модель: `--cnn-variant resnet` (по умолчанию). Для совместимости со старыми опытами доступны `base` и `large`.
+- По умолчанию используется `AdamW` + `OneCycleLR`, чтобы быстрее добирать качество в коротких запусках; старое снижение LR при плато: `--lr-schedule plateau` или legacy-флаг `--scheduler`.
+- Пример «усиленного» короткого прогона:
 
 ```bash
-python -m src.training.train --model cnn --cnn-variant large --class-weights --scheduler --label-smoothing 0.05 --tensorboard
+python -m src.training.train --model cnn --epochs 5 --cnn-variant resnet --mel-on-gpu --batch-size 4 --grad-accum-steps 4 --max-length-sec 2.5 --hop-length 640 --lr 1e-3 --lr-schedule onecycle --tensorboard
 ```
 
-Дополнительно: `--weight-decay 1e-4`, `--grad-clip 1.0` (по умолчанию), снижение LR при плато: `--scheduler`. Старые чекпоинты без поля `cnn_variant` в `evaluate`/`predict` считаются архитектурой `base`.
+Если важнее подтянуть минорные эмоции (`angry`, `positive`, `sad`), попробуйте добавить `--class-weights`; по умолчанию это мягкие sqrt-веса (`--class-weight-power 0.5`), а старое полное inverse-frequency поведение доступно как `--class-weight-power 1.0`. Старые чекпоинты без поля `cnn_variant` в `evaluate`/`predict` считаются архитектурой `base`.
 
 ### Ускорение обучения
 
-Узкое место — **CPU**: `librosa` в `Dataset` на каждый шаг. На **CUDA** по умолчанию включён **AMP** (см. сообщение при старте); отключить: `--no-amp`.
+Узкое место — **CPU**: `librosa` в `Dataset` на каждый шаг. На **CUDA** AMP включается только на достаточно новых GPU; на старых Pascal-картах вроде GTX 1050 Ti (`sm_61`) скрипт автоматически оставит FP32 на GPU, чтобы не ловить `nan` loss. Явно отключить AMP можно через `--no-amp`.
 
 **Mel на GPU (рекомендуется при CUDA):** флаг **`--mel-on-gpu`** — в батч попадает только сырой wav, log-mel считается **torchaudio** на GPU внутри модели. Обычно заметно быстрее полного librosa-пайплайна. Чекпоинт помечается `feature_config.mel_backend: torchaudio`; `evaluate` / `predict` подхватывают сами. Старые веса, обученные с librosa, с этим режимом не совместимы.
 
 ```bash
-python -m src.training.train --model cnn --mel-on-gpu --cnn-variant large --batch-size 64 ...
+python -m src.training.train --model cnn --mel-on-gpu --cnn-variant resnet --batch-size 64 ...
 ```
 
 - **`--num-workers`**: на **Windows** по умолчанию **0** (мультипроцессный DataLoader часто тормозит/зависает). На Linux можно **4–8**.
-- **`--batch-size 64`** (или выше, если хватает VRAM) — меньше итераций за эпоху.
-- **Короче аудио / реже кадры STFT** (меньше работы на сэмпл):
-  `--max-length-sec 2 --hop-length 768` или `--hop-length 1024`
-  (чуть грубее по времени, но быстрее; в чекпоинт пишется `feature_config` для `evaluate`/`predict`).
+- **`--batch-size 64`** (или выше, если хватает VRAM) — меньше итераций за эпоху. На 4GB GPU держите micro-batch 4-8 и поднимайте effective batch через `--grad-accum-steps`, например `--batch-size 4 --grad-accum-steps 4`.
+- **Короче аудио / реже кадры STFT** (меньше работы на сэмпл): для качества начните с `--max-length-sec 2.5 --hop-length 640`; варианты вроде `--max-length-sec 2 --hop-length 768` быстрее, но чаще режут accuracy.
 - **PyTorch 2+**: `--compile` может ускорить шаг на GPU после прогрева (экспериментально).
 
 Пример быстрого прогона:
 
 ```bash
-python -m src.training.train --model cnn --cnn-variant large --batch-size 64 --max-length-sec 2 --hop-length 768 --class-weights --scheduler --label-smoothing 0.05 --tensorboard --exp-name ser_fast
+python -m src.training.train --model cnn --cnn-variant resnet --mel-on-gpu --batch-size 4 --grad-accum-steps 4 --max-length-sec 2.5 --hop-length 640 --lr-schedule onecycle --tensorboard --exp-name ser_fast
 ```
 
 На Linux при необходимости добавьте `--num-workers 4`. На Windows оставьте значение по умолчанию (`0`), иначе возможны зависания.
